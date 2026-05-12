@@ -1,18 +1,16 @@
+# Pin Node versions: tap@14 breaks on current "latest" Node (e.g. v26); caller-path/treport crash.
+# Match exercised Node lines with GitHub Actions / legacy tar v4.
 language: node_js
-sudo: false
-
+os: linux
+dist: focal
 node_js:
-  - node
-  - 12
-  - 10
-  - 8
-
-os:
-  - linux
-
+  - "8"
+  - "10"
+  - "12"
+  - "14"
 cache:
-  directories:
-    - $HOME/.npm
-
-notifications:
-  email: false
+  npm: true
+install:
+  - npm ci
+script:
+  - npm test

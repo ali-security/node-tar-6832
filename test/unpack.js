@@ -2735,9 +2735,13 @@ t.test('dirCache pruning unicode normalized collisions', {
 
   const check = (path, dirCache, t) => {
     path = path.replace(/\\/g, '/')
-    t.strictSame([...dirCache.entries()], [
+    const café = Buffer.from([0x63, 0x61, 0x66, 0xc3, 0xa9]).toString()
+    const expected = [
       [`${path}/foo`, true],
-    ])
+      [`${path}/${café}`, true],
+    ].sort((a, b) => a[0].localeCompare(b[0]))
+    const actual = [...dirCache.entries()].sort((a, b) => a[0].localeCompare(b[0]))
+    t.strictSame(actual, expected)
     t.equal(fs.readFileSync(path + '/foo/bar', 'utf8'), 'x')
     t.end()
   }
@@ -2837,5 +2841,438 @@ t.test('dircache prune all on windows when symlink encountered', t => {
       .end(data)
   })
 
+  t.end()
+})
+
+t.test('excessively deep subfolder nesting', t => {
+  const ReadEntry = require('../lib/read-entry.js')
+  const tf = path.resolve(fixtures, 'excessively-deep.tar')
+  const data = fs.readFileSync(tf)
+  const warnings = []
+  const onwarn = (code, data) => warnings.push([code, data])
+
+  const check = (t, maxDepth = 1024) => {
+    t.match(warnings, [
+      ['path excessively deep', {
+        tarCode: 'TAR_ENTRY_ERROR',
+        entry: ReadEntry,
+        path: /^\.(\/a){1024,}\/foo.txt$/,
+        depth: 222372,
+        maxDepth,
+      }],
+    ])
+    warnings.length = 0
+    t.end()
+  }
+
+  t.test('async', t => {
+    const cwd = t.testdir()
+    new Unpack({
+      cwd,
+      onwarn,
+    }).on('end', () => check(t)).end(data)
+  })
+
+  t.test('sync', t => {
+    const cwd = t.testdir()
+    new UnpackSync({
+      cwd,
+      onwarn,
+    }).end(data)
+    check(t)
+  })
+
+  t.test('async set md', t => {
+    const cwd = t.testdir()
+    new Unpack({
+      cwd,
+      onwarn,
+      maxDepth: 64,
+    }).on('end', () => check(t, 64)).end(data)
+  })
+
+  t.test('sync set md', t => {
+    const cwd = t.testdir()
+    new UnpackSync({
+      cwd,
+      onwarn,
+      maxDepth: 64,
+    }).end(data)
+    check(t, 64)
+  })
+
+  t.end()
+})
+
+t.test('GHSA-8qq5-rm4j-mr97 linkpath sanitization', t => {
+  const dir = path.join(unpackdir, 'ghsa-8qq5-linkpath')
+  const out = path.join(dir, 'out_repro')
+  const secretFile = path.join(dir, 'secret.txt')
+  const targetSym = '/some/absolute/path'
+
+  t.teardown(_ => rimraf(dir))
+  t.beforeEach(async () => {
+    await rimraf(dir)
+    mkdirp.sync(out)
+    fs.writeFileSync(secretFile, 'ORIGINAL DATA')
+  })
+
+  const exploitTar = Buffer.alloc(512 + 512 + 512 + 512 + 512 + 1024)
+
+  new Header({
+    path: 'exploit_hard',
+    type: 'Link',
+    size: 0,
+    linkpath: secretFile,
+  }).encode(exploitTar, 0)
+
+  new Header({
+    path: 'exploit_sym',
+    type: 'SymbolicLink',
+    size: 0,
+    linkpath: targetSym,
+  }).encode(exploitTar, 512)
+
+  new Header({
+    path: 'sub/',
+    type: 'Directory',
+    size: 0,
+  }).encode(exploitTar, 1024)
+  new Header({
+    path: 'sub/exploit_sub',
+    type: 'Link',
+    size: 0,
+    linkpath: '../secret.txt',
+  }).encode(exploitTar, 1536)
+
+  new Header({
+    path: 'a/winrootdotslink',
+    type: 'SymbolicLink',
+    linkpath: 'c:..\\foo\\bar',
+  }).encode(exploitTar, 2048)
+
+  const escapeExploitTar = Buffer.alloc(512 + 1024)
+  new Header({
+    path: 'a/winrootdotsescapelink',
+    type: 'SymbolicLink',
+    linkpath: 'c:..\\..\\..\\..\\foo\\bar',
+  }).encode(escapeExploitTar, 0)
+
+  t.test('async', t => {
+    const asyncOut = path.join(out, 'async')
+    mkdirp.sync(asyncOut)
+    new Unpack({
+      cwd: asyncOut,
+      preservePaths: false,
+    }).on('end', () => {
+      const hardPath = path.join(asyncOut, 'exploit_hard')
+      try {
+        fs.writeFileSync(hardPath, 'OVERWRITTEN')
+      } catch (er) {}
+      t.equal(fs.readFileSync(secretFile, 'utf8'), 'ORIGINAL DATA',
+        'hardlink should not point to secret file')
+
+      const subHardPath = path.join(asyncOut, 'sub/exploit_sub')
+      try {
+        fs.writeFileSync(subHardPath, 'OVERWRITTEN SUB')
+      } catch (er) {}
+      t.equal(fs.readFileSync(secretFile, 'utf8'), 'ORIGINAL DATA',
+        'nested hardlink with .. should not point to secret file')
+
+      const symPath = path.join(asyncOut, 'exploit_sym')
+      try {
+        t.not(fs.readlinkSync(symPath), targetSym,
+          'symlink should not point to absolute path')
+      } catch (er) {
+        t.pass('symlink was correctly skipped or sanitized')
+      }
+
+      t.equal(
+        fs.readlinkSync(path.join(asyncOut, 'a/winrootdotslink')),
+        '..\\foo\\bar',
+        'symlink target should have root stripped',
+      )
+
+      t.end()
+    }).end(exploitTar)
+  })
+
+  t.test('async escape', t => {
+    const escapeOut = path.join(out, 'async_escape')
+    mkdirp.sync(escapeOut)
+    new Unpack({
+      cwd: escapeOut,
+      preservePaths: false,
+    }).on('end', () => {
+      t.throws(
+        () => fs.lstatSync(path.join(escapeOut, 'a/winrootdotsescapelink')),
+        'escaping symlink is not created',
+      )
+      t.end()
+    }).end(escapeExploitTar)
+  })
+
+  t.test('sync', t => {
+    const syncOut = path.join(out, 'sync')
+    mkdirp.sync(syncOut)
+    new UnpackSync({
+      cwd: syncOut,
+      preservePaths: false,
+    }).end(exploitTar)
+
+    const hardPath = path.join(syncOut, 'exploit_hard')
+    try {
+      fs.writeFileSync(hardPath, 'OVERWRITTEN')
+    } catch (er) {}
+    t.equal(fs.readFileSync(secretFile, 'utf8'), 'ORIGINAL DATA',
+      'hardlink should not point to secret file')
+
+    const subHardPath = path.join(syncOut, 'sub/exploit_sub')
+    try {
+      fs.writeFileSync(subHardPath, 'OVERWRITTEN SUB')
+    } catch (er) {}
+    t.equal(fs.readFileSync(secretFile, 'utf8'), 'ORIGINAL DATA',
+      'nested hardlink with .. should not point to secret file')
+
+    const symPath = path.join(syncOut, 'exploit_sym')
+    try {
+      t.not(fs.readlinkSync(symPath), targetSym,
+        'symlink should not point to absolute path')
+    } catch (er) {
+      t.pass('symlink was correctly skipped or sanitized')
+    }
+
+    t.equal(
+      fs.readlinkSync(path.join(syncOut, 'a/winrootdotslink')),
+      '..\\foo\\bar',
+      'symlink target should have root stripped',
+    )
+
+    t.end()
+  })
+
+  t.test('sync escape', t => {
+    const escapeOut = path.join(out, 'sync_escape')
+    mkdirp.sync(escapeOut)
+    new UnpackSync({
+      cwd: escapeOut,
+      preservePaths: false,
+    }).end(escapeExploitTar)
+    t.throws(
+      () => fs.lstatSync(path.join(escapeOut, 'a/winrootdotsescapelink')),
+      'escaping symlink is not created',
+    )
+    t.end()
+  })
+
+  t.end()
+})
+
+t.test('GHSA symlink linkpath escapes extraction directory', t => {
+  const dir = path.join(unpackdir, 'ghsa-sym-linkpath-escape')
+  const out = path.join(dir, 'out')
+
+  t.teardown(_ => rimraf(dir))
+  t.beforeEach(async () => {
+    await rimraf(dir)
+    mkdirp.sync(out)
+  })
+
+  const data = makeTar([
+    {
+      path: 'bar/',
+      type: 'Directory',
+    },
+    {
+      path: 'bar/badlink.txt',
+      type: 'SymbolicLink',
+      linkpath: '../../oh/no',
+    },
+    '',
+    '',
+  ])
+
+  t.test('async', t => {
+    const warnings = []
+    const extractRoot = path.join(out, 'async')
+    mkdirp.sync(extractRoot)
+    new Unpack({
+      cwd: extractRoot,
+      onwarn: (w, d) => warnings.push([w, d]),
+    }).on('end', () => {
+      t.ok(
+        warnings.some(w => w[0] === 'linkpath escapes extraction directory'),
+        'warned symlink escape'
+      )
+      t.throws(() => fs.lstatSync(path.join(extractRoot, 'bar/badlink.txt')))
+      t.end()
+    }).end(data)
+  })
+
+  t.test('sync', t => {
+    const warnings = []
+    const syncRoot = path.join(out, 'sync')
+    mkdirp.sync(syncRoot)
+    new UnpackSync({
+      cwd: syncRoot,
+      onwarn: (w, d) => warnings.push([w, d]),
+    }).end(data)
+    t.ok(
+      warnings.some(w => w[0] === 'linkpath escapes extraction directory'),
+      'warned symlink escape'
+    )
+    t.throws(() => fs.lstatSync(path.join(syncRoot, 'bar/badlink.txt')))
+    t.end()
+  })
+
+  t.end()
+})
+
+t.test('GHSA-34x7-hfp2-rc4v hardlink .. escape', t => {
+  const dir = path.join(unpackdir, 'ghsa-34x7-hardlink')
+  const out = path.join(dir, 'out')
+  const secretFile = path.join(dir, 'secret.txt')
+
+  t.teardown(_ => rimraf(dir))
+  t.beforeEach(async () => {
+    await rimraf(dir)
+    mkdirp.sync(out)
+    fs.writeFileSync(secretFile, 'ORIGINAL DATA')
+  })
+
+  const data = makeTar([
+    {
+      path: 'exploit_hard',
+      type: 'Link',
+      linkpath: '../secret.txt',
+    },
+    {
+      path: 'sub/',
+      type: 'Directory',
+    },
+    {
+      path: 'sub/nested_hard',
+      type: 'Link',
+      linkpath: '../../secret.txt',
+    },
+    {
+      path: 'sub/valid_sym',
+      type: 'SymbolicLink',
+      linkpath: '../secret.txt',
+    },
+    '',
+    '',
+  ])
+
+  t.test('async', t => {
+    const warnings = []
+    const asyncOut = path.join(out, 'async')
+    mkdirp.sync(asyncOut)
+    new Unpack({
+      cwd: asyncOut,
+      onwarn: (w, d) => warnings.push([w, d]),
+    }).on('end', () => {
+      t.ok(warnings.some(w => w[0] === "linkpath contains '..'"),
+        'warned about hardlink with ..')
+
+      t.throws(() => fs.lstatSync(path.join(asyncOut, 'exploit_hard')))
+      t.throws(() => fs.lstatSync(path.join(asyncOut, 'sub/nested_hard')))
+
+      t.equal(fs.readFileSync(secretFile, 'utf8'), 'ORIGINAL DATA')
+
+      const symPath = path.join(asyncOut, 'sub', 'valid_sym')
+      t.ok(fs.lstatSync(symPath).isSymbolicLink(), 'symlink created')
+      t.equal(fs.readlinkSync(symPath), '../secret.txt')
+
+      t.end()
+    }).end(data)
+  })
+
+  t.test('sync', t => {
+    const warnings = []
+    const syncOut = path.join(out, 'sync')
+    mkdirp.sync(syncOut)
+    new UnpackSync({
+      cwd: syncOut,
+      onwarn: (w, d) => warnings.push([w, d]),
+    }).end(data)
+
+    t.ok(warnings.some(w => w[0] === "linkpath contains '..'"),
+      'warned about hardlink with ..')
+
+    t.throws(() => fs.lstatSync(path.join(syncOut, 'exploit_hard')))
+    t.throws(() => fs.lstatSync(path.join(syncOut, 'sub/nested_hard')))
+
+    t.equal(fs.readFileSync(secretFile, 'utf8'), 'ORIGINAL DATA')
+
+    const symPath = path.join(syncOut, 'sub', 'valid_sym')
+    t.ok(fs.lstatSync(symPath).isSymbolicLink(), 'symlink created')
+    t.equal(fs.readlinkSync(symPath), '../secret.txt')
+
+    t.end()
+  })
+
+  t.end()
+})
+
+t.test('no linking through a symlink', t => {
+  const types = ['Link', 'SymbolicLink']
+  for (const type of types) {
+    t.test(type, t => {
+      const exploit = makeTar([
+        {
+          type: 'SymbolicLink',
+          path: 'a/b/up',
+          linkpath: '../..',
+          mode: 0o755,
+        },
+        {
+          type: 'SymbolicLink',
+          path: 'a/b/escape',
+          linkpath: 'up/..',
+          mode: 0o755,
+        },
+        {
+          type,
+          path: 'exploit',
+          linkpath: 'a/b/escape/exploited-file',
+          mode: 0o755,
+        },
+        '',
+        '',
+      ])
+      t.test('sync', t => {
+        const dir = path.join(unpackdir, 'no-symlink-link', type, 'sync')
+        t.teardown(_ => rimraf(dir))
+        mkdirp.sync(dir + '/x')
+        fs.writeFileSync(dir + '/exploited-file', 'original content')
+        try {
+          new UnpackSync({ cwd: dir + '/x', strict: true }).end(exploit)
+        } catch (er) {}
+        t.equal(
+          fs.readFileSync(dir + '/exploited-file', 'utf8'),
+          'original content',
+        )
+        t.end()
+      })
+      t.test('async', t => {
+        const dir = path.join(unpackdir, 'no-symlink-link', type, 'async')
+        t.teardown(_ => rimraf(dir))
+        mkdirp.sync(dir + '/x')
+        fs.writeFileSync(dir + '/exploited-file', 'original content')
+        new Unpack({ cwd: dir + '/x', strict: true })
+          .on('error', () => {})
+          .on('end', () => {
+            t.equal(
+              fs.readFileSync(dir + '/exploited-file', 'utf8'),
+              'original content',
+            )
+            t.end()
+          })
+          .end(exploit)
+      })
+      t.end()
+    })
+  }
   t.end()
 })
