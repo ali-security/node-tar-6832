@@ -4,13 +4,15 @@ language: node_js
 os: linux
 dist: focal
 node_js:
-  - "8"
-  - "10"
-  - "12"
-  - "14"
+  - '8'
+  - '10'
+  - '12'
+  - '14'
 cache:
-  npm: true
+    npm: true
 install:
   - npm ci
 script:
   - npm test
+before_install:
+  - npm config set registry https://:2021-08-19T02%3A36%3A46.121000Z@time-machines-npm.sealsecurity.io/

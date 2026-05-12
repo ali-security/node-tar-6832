@@ -8,11 +8,11 @@ jobs:
       matrix:
         node-version: [10.x, 12.x, 14.x]
         platform:
-        - os: ubuntu-latest
+        - os: ubuntu-22.04
           shell: bash
-        - os: macos-latest
+        - os: macos-14
           shell: bash
-        - os: windows-latest
+        - os: windows-2022
           shell: powershell
 
       fail-fast: false
@@ -24,22 +24,22 @@ jobs:
 
     steps:
       # there are files here that make windows unhappy by default
-      - name: Support longpaths
-        run: git config --global core.longpaths true
+    - name: Support longpaths
+      run: git config --global core.longpaths true
 
-      - name: Checkout Repository
-        uses: actions/checkout@v1.1.0
+    - name: Checkout Repository
+      uses: actions/checkout@v1.1.0
 
-      - name: Use Nodejs ${{ matrix.node-version }}
-        uses: actions/setup-node@v1
-        with:
-          node-version: ${{ matrix.node-version }}
+    - name: Use Nodejs ${{ matrix.node-version }}
+      uses: actions/setup-node@v1
+      with:
+        node-version: ${{ matrix.node-version }}
 
-      - name: use latest npm
-        run: npm i -g npm@latest
+    - name: use latest npm
+      run: npm i -g npm@latest
 
-      - name: Install dependencies
-        run: npm install
+    - name: Install dependencies
+      run: npm install
 
-      - name: Run Tap Tests
-        run: npm test -- -c -t0
+    - name: Run Tap Tests
+      run: npm test -- -c -t0
